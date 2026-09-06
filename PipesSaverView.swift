@@ -60,8 +60,6 @@ enum Tuning {
     static let runSeconds: ClosedRange<Double> = 30...50
     static let pipeCountRange = 4...6
     static let teapotChance = 1.0 / 200.0
-    static let candyTeapotChance = 1.0 / 20.0
-    static let candyRunChance = 1.0 / 20.0
     static let ballJointChance = 0.0          // "elbow" joint mode in the page
     static let gridHalf = 10                  // gridBounds -10...10
     static let pipeRadius = 0.2
@@ -522,8 +520,8 @@ struct Cell: Hashable { var x: Int, y: Int, z: Int }
 final class PipeState {
     var current: Cell
     var positions: [Cell]
-    let material: Material?         // nil = candy-cane texture run (see note in update)
-    init(start: Cell, material: Material?) { current = start; positions = [start]; self.material = material }
+    let material: Material
+    init(start: Cell, material: Material) { current = start; positions = [start]; self.material = material }
 }
 
 final class PipesWorld {
@@ -532,7 +530,6 @@ final class PipesWorld {
     var camera: Camera
     private var nodes = Set<Cell>()
     private var pipes: [PipeState] = []
-    private var runTexturePath = false
     private var runTeapotChance = Tuning.teapotChance
     private let disableTeapots: Bool
 
@@ -541,7 +538,6 @@ final class PipesWorld {
     private let ballMesh: Mesh
     private let elbowMesh: Mesh
     private let teapotMesh: Mesh
-    private let candyMaterial = Material(rgb: 0xffffff)
 
     // Wipe state (the dissolve): wall-clock driven like the page.
     private(set) var clearing = false
@@ -603,18 +599,12 @@ final class PipesWorld {
     // MARK: pipes
 
     private func spawnPipes() {
-        // pipeOptions for this run
-        runTexturePath = false
         runTeapotChance = disableTeapots ? 0 : Tuning.teapotChance
-        if chance(Tuning.candyRunChance) {
-            runTeapotChance = disableTeapots ? 0 : Tuning.candyTeapotChance
-            runTexturePath = true
-        }
         let pipeCount = randomInteger(Double(Tuning.pipeCountRange.lowerBound), Double(Tuning.pipeCountRange.upperBound))
         for _ in 0..<pipeCount {
             let g = Double(Tuning.gridHalf)
             let start = Cell(x: randomInteger(-g, g), y: randomInteger(-g, g), z: randomInteger(-g, g))
-            let material: Material? = runTexturePath ? nil : Material(rgb: Tuning.colors[chooseIndex(Tuning.colors.count)])
+            let material = Material(rgb: Tuning.colors[chooseIndex(Tuning.colors.count)])
             let pipe = PipeState(start: start, material: material)
             nodes.insert(start)     // the page does not check occupancy here either
             drawSphere(ballMesh, at: start, material: material)
@@ -662,24 +652,22 @@ final class PipesWorld {
 
     // MARK: drawing (only while not clearing; the page skips render then)
 
-    private func mat(_ m: Material?) -> Material { m ?? candyMaterial }
-
-    private func drawCylinder(from a: Cell, to b: Cell, material: Material?) {
+    private func drawCylinder(from a: Cell, to b: Cell, material: Material) {
         segments += 1
         guard !clearing else { return }
         let from = V3(Double(a.x), Double(a.y), Double(a.z)), to = V3(Double(b.x), Double(b.y), Double(b.z))
         let delta = to - from
         let q = Quat.fromUnitVectors(V3(0, 1, 0), delta.normalized)
         let position = from + delta * 0.5
-        fb.draw(cylinderMesh, position: position, rotation: q, material: mat(material))
+        fb.draw(cylinderMesh, position: position, rotation: q, material: material)
     }
 
-    private func drawSphere(_ mesh: Mesh, at c: Cell, material: Material?) {
+    private func drawSphere(_ mesh: Mesh, at c: Cell, material: Material) {
         guard !clearing else { return }
-        fb.draw(mesh, position: V3(Double(c.x), Double(c.y), Double(c.z)), rotation: .identity, material: mat(material))
+        fb.draw(mesh, position: V3(Double(c.x), Double(c.y), Double(c.z)), rotation: .identity, material: material)
     }
 
-    private func drawTeapot(at c: Cell, material: Material?) {
+    private func drawTeapot(at c: Cell, material: Material) {
         // The page: rotation.x/y/z = floor(random(0, 50)) * PI / 2 (three draws).
         let rx = (random(0, 50)).rounded(.down) * Double.pi / 2
         let ry = (random(0, 50)).rounded(.down) * Double.pi / 2
@@ -687,7 +675,7 @@ final class PipesWorld {
         teapots += 1
         guard !clearing else { return }
         fb.draw(teapotMesh, position: V3(Double(c.x), Double(c.y), Double(c.z)),
-                rotation: Quat.fromEulerXYZ(rx, ry, rz), material: mat(material))
+                rotation: Quat.fromEulerXYZ(rx, ry, rz), material: material)
     }
 
     // MARK: wipe

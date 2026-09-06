@@ -1,0 +1,32 @@
+MIT License
+
+Copyright (c) 2026 CharlesMod
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+Pipe growth rules, camera behaviour and scene parameters are ported from
+"pipes" by Isaiah Odhner (https://github.com/1j01/pipes), MIT License,
+Copyright (c) 2018 Isaiah Odhner, which itself follows the behaviour of the
+original Microsoft OpenGL screen saver (Windows NT 4.0 SDK sample).
+
+The Utah teapot tessellation in Teapot.swift is ported from
+THREE.TeapotBufferGeometry by Eric Haines (three.js examples, MIT License),
+using Martin Newell's original control point data.
