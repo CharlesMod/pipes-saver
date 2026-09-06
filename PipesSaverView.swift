@@ -1,26 +1,32 @@
-// PipesSaverView -- pixel-art 3D Pipes screen saver, rendered natively.
+// PipesSaverView -- 3D Pipes screen saver, rendered natively and matched
+// pixel-for-pixel against the three.js recreation of the Windows original.
 //
-// Energy design. The previous version hosted a WebGL page in a WKWebView,
-// which costs three helper processes (WebContent, GPU, Networking) plus
-// full-resolution shaded rendering every frame. This version has no web
-// stack at all:
-//   * The scene is an isometric software render into a framebuffer (one
-//     pixel per point by default, see Tuning) shown through a CALayer with
-//     nearest-neighbour magnification.
-//   * Pipe segments are analytic ray-traced sprites (cylinders and spheres)
-//     precomputed once per size, each pixel carrying its real depth, so a
-//     persistent z-buffer gives correct occlusion without ever redrawing
-//     the scene: a tick only blits the handful of new segments.
-//   * Frames go to the compositor through two IOSurfaces (double-buffered,
-//     zero-copy for the GPU); only the rectangles that changed since a
-//     surface was last shown are copied into it. Pushing a full-frame CGImage
-//     instead cost ~20% of a core at full resolution -- CA copies and
-//     converts it on the main thread every frame.
+// Fidelity design. The reference is ~/Software/pipes/index.html (the web
+// recreation, itself checked against the NT 4 SDK source). This file ports
+// it rather than approximating it:
+//   * Same random generator (mulberry32) consumed in the same order, so a
+//     seed produces the same pipe network, colours, joints and camera.
+//   * Same geometry: three.js CylinderBufferGeometry(r, r, 1, 10, 4, open)
+//     and SphereBufferGeometry(r, 8, 8), with the same vertex normals,
+//     placed with the same quaternion maths.
+//   * Same camera: PerspectiveCamera(45, aspect, 1, 1e5) at (0,0,14) or
+//     (14,0,0) rotated 90 degrees about a random (unnormalised!) axis,
+//     lookAt(origin), then OrbitControls.update()'s spherical round trip.
+//   * Same shading: MeshPhongMaterial (specular 0xa9fcff, shininess 100,
+//     emissive = colour * 0.3) under AmbientLight(0x111111) and a 0.9
+//     DirectionalLight from (-1.2, 1.5, 0.5), evaluated with r98's exact
+//     Blinn-Phong terms, per fragment, on interpolated normals.
+//   * Same rasterisation model: triangles sampled at pixel centres, depth
+//     LEQUAL, perspective-correct attribute interpolation, no antialiasing.
+// compare/ holds the scripts that render both with one seed and diff them.
+//
+// Energy design. Nothing is redrawn: each new segment is rasterised once into
+// a persistent colour + depth buffer, and frames reach the compositor through
+// double-buffered IOSurfaces with dirty-rect copies (see pushFrame).
 //
 // Lifecycle notes (macOS 14+ legacyScreenSaver host, verified with logging):
-//   * The host is a view service composited remotely by WallpaperAgent, so
-//     this process never sees its own window as visible; do not gate on
-//     occlusion.
+//   * The host is a view service composited remotely by WallpaperAgent; this
+//     process never sees its window as visible, so never gate on occlusion.
 //   * Each activation creates a NEW view, re-fires startAnimation() on every
 //     OLD view first, never calls stopAnimation(), and never releases views.
 //     Only the newest instance renders; com.apple.screensaver.willstop /
@@ -43,72 +49,275 @@ private var liveInstances = NSHashTable<PipesSaverView>.weakObjects()
 // MARK: - TUNING ------------------------------------------------------------
 
 enum Tuning {
-    /// Frame pushes per second. Every push wakes the compositor, so this is
-    /// the main energy knob. 30 matches the original; 20 or 15 for pixel art.
+    /// Update rounds (and frame pushes) per second; the reference targets 30.
     static let tickHz: Double = 30
-    /// Growth speed: move attempts per second per pipe (original: one per
-    /// rendered frame, ~30).
-    static let stepsPerSecondPerPipe: Double = 20
-    static let pipeCountRange = 4...6
-    /// Seconds between wipes.
-    static let runSeconds: ClosedRange<Double> = 30...50
-    static let wipeSeconds: Double = 2
-    /// Wipe block size in framebuffer pixels.
-    static let wipeBlock = 20
-    /// Grid half-extents. A flatter box than the original cube fits an
-    /// isometric view of the whole thing on a 3:2 screen.
-    static let gridX = 10, gridY = 6, gridZ = 10
-    static let pipeRadius: Float = 0.30
-    static let ballRadius: Float = 0.45
-    static let teapotChance = 1.0 / 200.0
-    /// Framebuffer width the renderer aims for; the integer scale factor is
-    /// derived from the view size so pixels stay square. 1500 means scale 1
-    /// (one framebuffer pixel per point) on any normal display; 480 gives the
-    /// chunky 3x pixel-art look.
+    /// 1500 = one framebuffer pixel per point (matches the reference page at
+    /// pixel ratio 1). Lower values give integer-scaled chunky pixels.
     static let targetFramebufferWidth: CGFloat = 1500
-    /// Pipe palette (red, green, blue, amber) -- edit freely.
+    /// Pipe palette, as in the reference page (red, green, blue, amber).
     static let colors: [UInt32] = [0xd83a3a, 0x39b54a, 0x2f6fdc, 0xe0b020]
-    /// Shading bands, darkest to brightest; a specular band is added. Eight
-    /// reads as a rounded tube; five reads as pixel art.
-    static let shadeBands: [Float] = [0.22, 0.33, 0.44, 0.55, 0.66, 0.78, 0.89, 1.0]
-    static let lightDirection: (Float, Float, Float) = (-0.45, 0.80, -0.55)
+    /// Seconds between wipes (options.interval in the page).
+    static let runSeconds: ClosedRange<Double> = 30...50
+    static let pipeCountRange = 4...6
+    static let teapotChance = 1.0 / 200.0
+    static let candyTeapotChance = 1.0 / 20.0
+    static let candyRunChance = 1.0 / 20.0
+    static let ballJointChance = 0.0          // "elbow" joint mode in the page
+    static let gridHalf = 10                  // gridBounds -10...10
+    static let pipeRadius = 0.2
+    static let ballJointRadius = 0.2 * 1.5
+    static let teapotSize = 0.2 * 1.5
+    static let wipeSeconds = 2.0
 }
 
-// MARK: - Geometry helpers --------------------------------------------------
+// MARK: - Deterministic random (mulberry32, identical to the page) ----------
 
-struct Cell: Hashable {
-    var x: Int, y: Int, z: Int
-    static func + (a: Cell, b: Cell) -> Cell { Cell(x: a.x + b.x, y: a.y + b.y, z: a.z + b.z) }
-    static let axes: [Cell] = [Cell(x: 1, y: 0, z: 0), Cell(x: -1, y: 0, z: 0),
-                               Cell(x: 0, y: 1, z: 0), Cell(x: 0, y: -1, z: 0),
-                               Cell(x: 0, y: 0, z: 1), Cell(x: 0, y: 0, z: -1)]
-}
-
-/// One pre-shaded sprite pixel: screen offset from the anchor cell's
-/// projection, depth offset from the anchor cell's depth, shade band index
-/// (Tuning.shadeBands.count == specular highlight).
-struct SpritePixel {
-    var dx: Int32
-    var dy: Int32
-    var depth: Float
-    var band: UInt8
-}
-
-struct Sprite {
-    var pixels: [SpritePixel] = []
-    var minX: Int32 = 0, minY: Int32 = 0, maxX: Int32 = 0, maxY: Int32 = 0
-    /// Compute the bounding box (inclusive) once the pixels are final.
-    mutating func finalize() {
-        guard let f = pixels.first else { return }
-        minX = f.dx; maxX = f.dx; minY = f.dy; maxY = f.dy
-        for p in pixels {
-            if p.dx < minX { minX = p.dx }; if p.dx > maxX { maxX = p.dx }
-            if p.dy < minY { minY = p.dy }; if p.dy > maxY { maxY = p.dy }
-        }
+struct Mulberry32 {
+    var a: UInt32
+    mutating func next() -> Double {
+        a &+= 0x6D2B79F5
+        var t = a
+        t = (t ^ (t >> 15)) &* (t | 1)
+        t = (t &+ ((t ^ (t >> 7)) &* (t | 61))) ^ t
+        return Double(t ^ (t >> 14)) / 4294967296
     }
 }
 
-/// Framebuffer rectangle, half-open: x0 <= x < x1, y0 <= y < y1.
+/// JavaScript Math.round: ties toward +infinity.
+@inline(__always) private func jsRound(_ x: Double) -> Double { (x + 0.5).rounded(.down) }
+
+// MARK: - Vector maths (Double, mirroring three.js which computes in JS numbers)
+
+struct V3: Equatable {
+    var x: Double, y: Double, z: Double
+    init(_ x: Double, _ y: Double, _ z: Double) { self.x = x; self.y = y; self.z = z }
+    static func + (a: V3, b: V3) -> V3 { V3(a.x + b.x, a.y + b.y, a.z + b.z) }
+    static func - (a: V3, b: V3) -> V3 { V3(a.x - b.x, a.y - b.y, a.z - b.z) }
+    static func * (a: V3, s: Double) -> V3 { V3(a.x * s, a.y * s, a.z * s) }
+    func dot(_ b: V3) -> Double { x * b.x + y * b.y + z * b.z }
+    func cross(_ b: V3) -> V3 { V3(y * b.z - z * b.y, z * b.x - x * b.z, x * b.y - y * b.x) }
+    var lengthSq: Double { x * x + y * y + z * z }
+    var length: Double { lengthSq.squareRoot() }
+    /// three.js Vector3.normalize(): divides by (length || 1).
+    var normalized: V3 { let l = length; let d = l == 0 ? 1 : l; return V3(x / d, y / d, z / d) }
+}
+
+struct Quat {
+    var x: Double, y: Double, z: Double, w: Double
+    static let identity = Quat(x: 0, y: 0, z: 0, w: 1)
+
+    /// three.js Quaternion.setFromUnitVectors (r98).
+    static func fromUnitVectors(_ from: V3, _ to: V3) -> Quat {
+        let eps = 0.000001
+        var r = from.dot(to) + 1
+        var v: V3
+        if r < eps {
+            r = 0
+            if abs(from.x) > abs(from.z) { v = V3(-from.y, from.x, 0) } else { v = V3(0, -from.z, from.y) }
+        } else {
+            v = from.cross(to)
+        }
+        return Quat(x: v.x, y: v.y, z: v.z, w: r).normalized
+    }
+
+    /// three.js Quaternion.setFromEuler, order XYZ.
+    static func fromEulerXYZ(_ x: Double, _ y: Double, _ z: Double) -> Quat {
+        let c1 = cos(x / 2), c2 = cos(y / 2), c3 = cos(z / 2)
+        let s1 = sin(x / 2), s2 = sin(y / 2), s3 = sin(z / 2)
+        return Quat(x: s1 * c2 * c3 + c1 * s2 * s3,
+                    y: c1 * s2 * c3 - s1 * c2 * s3,
+                    z: c1 * c2 * s3 + s1 * s2 * c3,
+                    w: c1 * c2 * c3 - s1 * s2 * s3)
+    }
+
+    var normalized: Quat {
+        let l = (x * x + y * y + z * z + w * w).squareRoot()
+        if l == 0 { return .identity }
+        return Quat(x: x / l, y: y / l, z: z / l, w: w / l)
+    }
+
+    /// three.js Vector3.applyQuaternion.
+    func rotate(_ v: V3) -> V3 {
+        let ix = w * v.x + y * v.z - z * v.y
+        let iy = w * v.y + z * v.x - x * v.z
+        let iz = w * v.z + x * v.y - y * v.x
+        let iw = -x * v.x - y * v.y - z * v.z
+        return V3(ix * w + iw * -x + iy * -z - iz * -y,
+                  iy * w + iw * -y + iz * -x - ix * -z,
+                  iz * w + iw * -z + ix * -y - iy * -x)
+    }
+}
+
+/// three.js Matrix4.makeRotationAxis(axis, angle) applied to a point --
+/// note the page passes an UNNORMALISED axis, so this is generally not a
+/// pure rotation. Reproduced as-is.
+private func applyRotationAxisMatrix(_ v: V3, axis: V3, angle: Double) -> V3 {
+    let c = cos(angle), s = sin(angle), t = 1 - c
+    let x = axis.x, y = axis.y, z = axis.z
+    let tx = t * x, ty = t * y
+    let r0 = V3(tx * x + c, tx * y - s * z, tx * z + s * y)
+    let r1 = V3(tx * y + s * z, ty * y + c, ty * z - s * x)
+    let r2 = V3(tx * z - s * y, ty * z + s * x, t * z * z + c)
+    return V3(r0.dot(v), r1.dot(v), r2.dot(v))
+}
+
+// MARK: - Camera (PerspectiveCamera + lookAt + OrbitControls.update) --------
+
+struct Camera {
+    var position = V3(0, 0, 14)
+    // Rotation columns: the camera's local x, y, z axes in world space.
+    var ax = V3(1, 0, 0), ay = V3(0, 1, 0), az = V3(0, 0, 1)
+    let fov = 45.0, near = 1.0, far = 100000.0
+    var aspect: Double
+
+    /// three.js Matrix4.lookAt(eye, target, up=(0,1,0)) as used by cameras.
+    mutating func lookAt(_ target: V3) {
+        var z = position - target
+        if z.lengthSq == 0 { z.z = 1 }
+        z = z.normalized
+        let up = V3(0, 1, 0)
+        var x = up.cross(z)
+        if x.lengthSq == 0 {
+            if abs(up.z) == 1 { z.x += 0.0001 } else { z.z += 0.0001 }
+            z = z.normalized
+            x = up.cross(z)
+        }
+        x = x.normalized
+        ax = x; az = z; ay = z.cross(x)
+    }
+
+    /// OrbitControls.update() with no input: the position takes a round trip
+    /// through spherical coordinates (with makeSafe) and lookAt runs again.
+    mutating func orbitControlsUpdate(target: V3 = V3(0, 0, 0)) {
+        let offset = position - target
+        let radius = offset.length
+        var theta = 0.0, phi = 0.0
+        if radius != 0 {
+            theta = atan2(offset.x, offset.z)
+            phi = acos(min(1, max(-1, offset.y / radius)))
+        }
+        let eps = 0.000001
+        phi = max(0, min(Double.pi, phi))
+        phi = max(eps, min(Double.pi - eps, phi))
+        let sinPhiRadius = sin(phi) * radius
+        position = target + V3(sinPhiRadius * sin(theta), cos(phi) * radius, sinPhiRadius * cos(theta))
+        lookAt(target)
+    }
+
+    func toView(_ p: V3) -> V3 { let d = p - position; return V3(d.dot(ax), d.dot(ay), d.dot(az)) }
+    func toViewDir(_ v: V3) -> V3 { V3(v.dot(ax), v.dot(ay), v.dot(az)) }
+
+    /// makePerspective terms: clip = (sx*x, sy*y, c*z + d, -z).
+    var projection: (sx: Double, sy: Double, c: Double, d: Double) {
+        let top = near * tan(Double.pi / 180 * 0.5 * fov)
+        let height = 2 * top, width = aspect * height
+        let sx = 2 * near / width, sy = 2 * near / height
+        let c = -(far + near) / (far - near), d = -2 * far * near / (far - near)
+        return (sx, sy, c, d)
+    }
+}
+
+// MARK: - Meshes (three.js r98 geometry generators) -------------------------
+
+struct Mesh {
+    var positions: [V3] = []
+    var normals: [V3] = []
+    var indices: [Int] = []
+    /// three.js stores attributes in Float32Arrays; round the same way.
+    mutating func roundToFloat32() {
+        func f(_ v: V3) -> V3 { V3(Double(Float(v.x)), Double(Float(v.y)), Double(Float(v.z))) }
+        positions = positions.map(f)
+        normals = normals.map(f)
+    }
+}
+
+enum MeshFactory {
+    /// CylinderBufferGeometry(radiusTop, radiusBottom, height, radial, heightSeg, openEnded=true)
+    static func cylinder(radiusTop: Double, radiusBottom: Double, height: Double,
+                         radialSegments: Int, heightSegments: Int) -> Mesh {
+        var m = Mesh()
+        let halfHeight = height / 2
+        let slope = (radiusBottom - radiusTop) / height
+        var grid: [[Int]] = []
+        var index = 0
+        for y in 0...heightSegments {
+            var row: [Int] = []
+            let v = Double(y) / Double(heightSegments)
+            let radius = v * (radiusBottom - radiusTop) + radiusTop
+            for x in 0...radialSegments {
+                let u = Double(x) / Double(radialSegments)
+                let theta = u * 2 * Double.pi
+                let sinTheta = sin(theta), cosTheta = cos(theta)
+                m.positions.append(V3(radius * sinTheta, -v * height + halfHeight, radius * cosTheta))
+                m.normals.append(V3(sinTheta, slope, cosTheta).normalized)
+                row.append(index); index += 1
+            }
+            grid.append(row)
+        }
+        for x in 0..<radialSegments {
+            for y in 0..<heightSegments {
+                let a = grid[y][x], b = grid[y + 1][x], c = grid[y + 1][x + 1], d = grid[y][x + 1]
+                m.indices += [a, b, d, b, c, d]
+            }
+        }
+        m.roundToFloat32()
+        return m
+    }
+
+    /// SphereBufferGeometry(radius, widthSegments, heightSegments)
+    static func sphere(radius: Double, widthSegments: Int, heightSegments: Int) -> Mesh {
+        var m = Mesh()
+        var grid: [[Int]] = []
+        var index = 0
+        let thetaStart = 0.0, thetaLength = Double.pi, phiStart = 0.0, phiLength = 2 * Double.pi
+        for iy in 0...heightSegments {
+            var row: [Int] = []
+            let v = Double(iy) / Double(heightSegments)
+            for ix in 0...widthSegments {
+                let u = Double(ix) / Double(widthSegments)
+                let p = V3(-radius * cos(phiStart + u * phiLength) * sin(thetaStart + v * thetaLength),
+                           radius * cos(thetaStart + v * thetaLength),
+                           radius * sin(phiStart + u * phiLength) * sin(thetaStart + v * thetaLength))
+                m.positions.append(p)
+                m.normals.append(p.normalized)
+                row.append(index); index += 1
+            }
+            grid.append(row)
+        }
+        let thetaEnd = thetaStart + thetaLength
+        for iy in 0..<heightSegments {
+            for ix in 0..<widthSegments {
+                let a = grid[iy][ix + 1], b = grid[iy][ix], c = grid[iy + 1][ix], d = grid[iy + 1][ix + 1]
+                if iy != 0 || thetaStart > 0 { m.indices += [a, b, d] }
+                if iy != heightSegments - 1 || thetaEnd < Double.pi { m.indices += [b, c, d] }
+            }
+        }
+        m.roundToFloat32()
+        return m
+    }
+}
+
+// MARK: - Material and lighting (MeshPhongMaterial under the page's lights) --
+
+struct Material {
+    var color: (Float, Float, Float)
+    var emissive: (Float, Float, Float)
+    static let specular: (Float, Float, Float) = (0xa9 / 255.0, 0xfc / 255.0, 0xff / 255.0)
+    static let shininess: Float = 100
+    static let ambient: Float = 0x11 / 255.0        // AmbientLight(0x111111)
+    static let lightIntensity: Float = 0.9          // DirectionalLight(0xffffff, 0.9)
+    static let lightPosition = V3(-1.2, 1.5, 0.5)   // target: origin
+
+    init(rgb: UInt32) {
+        let r = Float((rgb >> 16) & 0xff) / 255, g = Float((rgb >> 8) & 0xff) / 255, b = Float(rgb & 0xff) / 255
+        color = (r, g, b)
+        emissive = (r * 0.3, g * 0.3, b * 0.3)   // new THREE.Color(color).multiplyScalar(0.3)
+    }
+}
+
+// MARK: - Framebuffer + rasteriser --------------------------------------------
+
+/// Framebuffer rectangle, half-open: x0 <= x < x1, y0 <= y < y1 (top-down rows).
 struct DirtyRect {
     var x0: Int, y0: Int, x1: Int, y1: Int
     var isEmpty: Bool { x1 <= x0 || y1 <= y0 }
@@ -117,427 +326,442 @@ struct DirtyRect {
     }
 }
 
-/// Isometric projection with the camera looking along (1,-1,1): a unit step
-/// in x moves (+2u, -u) on screen, in z moves (-2u, -u), in y moves (0, -2u).
-/// Depth increases away from the camera: depth = x + z - y.
-struct Projection {
-    let u: Float
-    func screen(_ x: Float, _ y: Float, _ z: Float) -> (Float, Float) {
-        ((x - z) * 2 * u, -(x + z) * u - y * 2 * u)
-    }
-    static func depth(_ x: Float, _ y: Float, _ z: Float) -> Float { x + z - y }
-    /// Any world point that projects to the given screen offset (y = 0 plane).
-    func rayOrigin(sx: Float, sy: Float) -> (Float, Float, Float) {
-        let a = sx / (2 * u)   // x - z
-        let b = -sy / u        // x + z
-        return ((a + b) / 2, 0, (b - a) / 2)
-    }
-}
-
-// MARK: - Sprite generation (analytic ray tracing, done once per size) ------
-
-enum SpriteFactory {
-    private static let inv3: Float = 1 / Float(3).squareRoot()
-    /// View direction (into the scene).
-    private static let view: (Float, Float, Float) = (inv3, -inv3, inv3)
-    private static let light: (Float, Float, Float) = {
-        let l = Tuning.lightDirection
-        let n = (l.0 * l.0 + l.1 * l.1 + l.2 * l.2).squareRoot()
-        return (l.0 / n, l.1 / n, l.2 / n)
-    }()
-    private static let half: (Float, Float, Float) = {
-        // Half vector between the light and the direction toward the camera.
-        let h = (light.0 - view.0, light.1 - view.1, light.2 - view.2)
-        let n = (h.0 * h.0 + h.1 * h.1 + h.2 * h.2).squareRoot()
-        return (h.0 / n, h.1 / n, h.2 / n)
-    }()
-
-    private static func band(forNormal n: (Float, Float, Float)) -> UInt8 {
-        let diffuse = max(0, n.0 * light.0 + n.1 * light.1 + n.2 * light.2)
-        let spec = max(0, n.0 * half.0 + n.1 * half.1 + n.2 * half.2)
-        if spec > 0.975 { return UInt8(Tuning.shadeBands.count) } // highlight
-        let v = 0.18 + 0.82 * diffuse
-        let idx = min(Tuning.shadeBands.count - 1, Int(v * Float(Tuning.shadeBands.count)))
-        return UInt8(max(0, idx))
-    }
-
-    /// Open cylinder of radius r from the origin along +axis (0=x, 1=y, 2=z),
-    /// length 1. Front faces only, like the original's FrontSide material.
-    static func cylinder(axis: Int, radius r: Float, proj: Projection) -> Sprite {
-        var sprite = Sprite()
-        var end: (Float, Float, Float) = (0, 0, 0)
-        if axis == 0 { end.0 = 1 } else if axis == 1 { end.1 = 1 } else { end.2 = 1 }
-        let p0 = proj.screen(0, 0, 0), p1 = proj.screen(end.0, end.1, end.2)
-        let m = Int((r * 3 * proj.u).rounded(.up)) + 2
-        let xMin = Int(min(p0.0, p1.0).rounded(.down)) - m, xMax = Int(max(p0.0, p1.0).rounded(.up)) + m
-        let yMin = Int(min(p0.1, p1.1).rounded(.down)) - m, yMax = Int(max(p0.1, p1.1).rounded(.up)) + m
-        for py in yMin...yMax {
-            for px in xMin...xMax {
-                let o = proj.rayOrigin(sx: Float(px) + 0.5, sy: Float(py) + 0.5)
-                // Perpendicular components (axis component zeroed).
-                var op = o, vp = view
-                switch axis {
-                case 0: op.0 = 0; vp.0 = 0
-                case 1: op.1 = 0; vp.1 = 0
-                default: op.2 = 0; vp.2 = 0
-                }
-                let A = vp.0 * vp.0 + vp.1 * vp.1 + vp.2 * vp.2
-                let B = 2 * (op.0 * vp.0 + op.1 * vp.1 + op.2 * vp.2)
-                let C = op.0 * op.0 + op.1 * op.1 + op.2 * op.2 - r * r
-                let disc = B * B - 4 * A * C
-                guard disc >= 0 else { continue }
-                let t = (-B - disc.squareRoot()) / (2 * A)   // near root = front face
-                let q = (o.0 + t * view.0, o.1 + t * view.1, o.2 + t * view.2)
-                let s = axis == 0 ? q.0 : (axis == 1 ? q.1 : q.2)
-                guard s >= 0, s <= 1 else { continue }
-                var n = q
-                if axis == 0 { n.0 = 0 } else if axis == 1 { n.1 = 0 } else { n.2 = 0 }
-                n = (n.0 / r, n.1 / r, n.2 / r)
-                sprite.pixels.append(SpritePixel(dx: Int32(px), dy: Int32(py),
-                                                 depth: Projection.depth(q.0, q.1, q.2),
-                                                 band: band(forNormal: n)))
-            }
-        }
-        sprite.finalize()
-        return sprite
-    }
-
-    static func sphere(radius r: Float, proj: Projection, depthBias: Float = 0) -> Sprite {
-        var sprite = Sprite()
-        let m = Int((r * 3 * proj.u).rounded(.up)) + 2
-        for py in -m...m {
-            for px in -m...m {
-                let o = proj.rayOrigin(sx: Float(px) + 0.5, sy: Float(py) + 0.5)
-                let B = 2 * (o.0 * view.0 + o.1 * view.1 + o.2 * view.2)
-                let C = o.0 * o.0 + o.1 * o.1 + o.2 * o.2 - r * r
-                let disc = B * B - 4 * C
-                guard disc >= 0 else { continue }
-                let t = (-B - disc.squareRoot()) / 2
-                let q = (o.0 + t * view.0, o.1 + t * view.1, o.2 + t * view.2)
-                let n = (q.0 / r, q.1 / r, q.2 / r)
-                sprite.pixels.append(SpritePixel(dx: Int32(px), dy: Int32(py),
-                                                 depth: Projection.depth(q.0, q.1, q.2) + depthBias,
-                                                 band: band(forNormal: n)))
-            }
-        }
-        sprite.finalize()
-        return sprite
-    }
-
-    /// Utah teapot, pixel-art edition. Rows top to bottom; digits are shade
-    /// bands (1 darkest), '*' the highlight, '.' transparent.
-    private static let teapotArt: [String] = [
-        "......*22......",
-        ".....23332.....",
-        "....2333332....",
-        "..4443333332...",
-        ".4.3333333322.2",
-        ".4.4333333221.1",
-        "..4433333221.1.",
-        "...3332221111..",
-        "....22111111...",
-        ".....111111....",
-    ]
-
-    static func teapot(proj: Projection, radius r: Float) -> Sprite {
-        var sprite = Sprite()
-        // Scale the art so the teapot is about 1.4x the ball joint's width.
-        let targetW = max(9, Int((r * 2 * 2 * proj.u * 1.4).rounded()))
-        let artW = teapotArt[0].count, artH = teapotArt.count
-        let scale = max(1, targetW / artW)
-        let w = artW * scale, h = artH * scale
-        for (row, line) in teapotArt.enumerated() {
-            for (col, ch) in line.enumerated() {
-                let band: UInt8
-                switch ch {
-                case "*": band = UInt8(Tuning.shadeBands.count)
-                case "1": band = 0
-                case "2": band = 1
-                case "3": band = 2
-                case "4": band = 3
-                default: continue
-                }
-                for sy in 0..<scale {
-                    for sx in 0..<scale {
-                        sprite.pixels.append(SpritePixel(dx: Int32(col * scale + sx - w / 2),
-                                                         dy: Int32(row * scale + sy - h / 2 - 2),
-                                                         depth: -0.9, // sits in front of its joint
-                                                         band: band))
-                    }
-                }
-            }
-        }
-        sprite.finalize()
-        return sprite
-    }
-}
-
-// MARK: - Scene -------------------------------------------------------------
-
-final class Pipe {
-    var current: Cell
-    var lastDirection: Cell?
-    let palette: [UInt32]
-    var stepAccumulator: Double = 0
-    init(start: Cell, palette: [UInt32]) { current = start; self.palette = palette }
-}
-
-final class PipesScene {
+final class Framebuffer {
     let width: Int, height: Int
-    let proj: Projection
-    private(set) var pixels: [UInt32]
-    private var depth: [Float]
-    private var occupied: [Bool]
-    private var pipes: [Pipe] = []
-    private var rotation = 0
-    private let originX: Float, originY: Float
-
-    private let cylinders: [Sprite]   // along +x, +y, +z
-    private let ball: Sprite
-    private let elbow: Sprite
-    private let teapot: Sprite
-    private let palettes: [[UInt32]]  // per colour: bands + highlight
-
-    // Run / wipe state
-    private var runEndsAt: TimeInterval = 0
-    private var wipeBlocks: [Int] = []
-    private var wipeIndex = 0
-    private var wipeBlocksPerTick = 0
-
-    // Regions changed since the last clearDirty(); the view copies exactly these.
+    private(set) var pixels: [UInt32]     // BGRA little-endian, opaque; row 0 = top
+    private var depth: [Float]            // NDC z, +inf = cleared
     private(set) var dirtyRects: [DirtyRect] = []
-    var dirty: Bool { !dirtyRects.isEmpty }
     let fullRect: DirtyRect
+    var dirty: Bool { !dirtyRects.isEmpty }
 
-    // Stats
-    private(set) var segments = 0
-    private(set) var wipes = 0
-    private(set) var ticks = 0
-
-    private static let gridW = 2 * Tuning.gridX + 1
-    private static let gridH = 2 * Tuning.gridY + 1
-    private static let gridD = 2 * Tuning.gridZ + 1
+    // Camera terms in Float, refreshed by setCamera().
+    private var camPos = (Float(0), Float(0), Float(0))
+    private var camAx = (Float(1), Float(0), Float(0)), camAy = (Float(0), Float(1), Float(0)), camAz = (Float(0), Float(0), Float(1))
+    private var projSx: Float = 1, projSy: Float = 1, projC: Float = -1, projD: Float = -2
+    private var lightDirView = (Float(0), Float(0), Float(1))
+    private var near: Float = 1
 
     init(width: Int, height: Int) {
-        self.width = width
-        self.height = height
+        self.width = width; self.height = height
         fullRect = DirtyRect(x0: 0, y0: 0, x1: width, y1: height)
         pixels = [UInt32](repeating: 0xFF000000, count: width * height)
         depth = [Float](repeating: .greatestFiniteMagnitude, count: width * height)
-        occupied = [Bool](repeating: false, count: PipesScene.gridW * PipesScene.gridH * PipesScene.gridD)
-
-        // Pixels per grid unit: fit the whole box (a hexagonal silhouette)
-        // into the framebuffer with a small margin.
-        let spanX = Float(2 * (Tuning.gridX + Tuning.gridZ) + 2) * 2   // in units of u
-        let spanY = Float(Tuning.gridX + Tuning.gridZ + 2) + Float(2 * Tuning.gridY + 2) * 2
-        let u = max(2, min(Float(width) * 0.94 / spanX, Float(height) * 0.94 / spanY).rounded(.down))
-        let p = Projection(u: u)
-        proj = p
-        originX = Float(width) / 2
-        originY = Float(height) / 2
-
-        cylinders = (0..<3).map { SpriteFactory.cylinder(axis: $0, radius: Tuning.pipeRadius, proj: p) }
-        ball = SpriteFactory.sphere(radius: Tuning.ballRadius, proj: p)
-        elbow = SpriteFactory.sphere(radius: Tuning.pipeRadius, proj: p, depthBias: -0.01)
-        teapot = SpriteFactory.teapot(proj: p, radius: Tuning.ballRadius)
-        palettes = Tuning.colors.map { PipesScene.makePalette($0) }
-
-        startRun()
     }
 
-    private static func makePalette(_ rgb: UInt32) -> [UInt32] {
-        let r = Float((rgb >> 16) & 0xff), g = Float((rgb >> 8) & 0xff), b = Float(rgb & 0xff)
-        func pack(_ r: Float, _ g: Float, _ b: Float) -> UInt32 {
-            let R = UInt32(max(0, min(255, r))), G = UInt32(max(0, min(255, g))), B = UInt32(max(0, min(255, b)))
-            return 0xFF000000 | (R << 16) | (G << 8) | B   // BGRA little-endian, opaque
-        }
-        var p = Tuning.shadeBands.map { pack(r * $0, g * $0, b * $0) }
-        p.append(pack(r + (255 - r) * 0.65, g + (255 - g) * 0.65, b + (255 - b) * 0.65)) // highlight
-        return p
+    func clear() {
+        pixels.withUnsafeMutableBufferPointer { $0.update(repeating: 0xFF000000) }
+        depth.withUnsafeMutableBufferPointer { $0.update(repeating: .greatestFiniteMagnitude) }
+        dirtyRects = [fullRect]
     }
 
-    // MARK: grid
-
-    private func index(_ c: Cell) -> Int {
-        ((c.y + Tuning.gridY) * PipesScene.gridD + (c.z + Tuning.gridZ)) * PipesScene.gridW + (c.x + Tuning.gridX)
-    }
-    private func inBounds(_ c: Cell) -> Bool {
-        abs(c.x) <= Tuning.gridX && abs(c.y) <= Tuning.gridY && abs(c.z) <= Tuning.gridZ
-    }
-
-    /// Per-run view rotation about the vertical axis (four isometric views).
-    private func rotated(_ c: Cell) -> Cell {
-        switch rotation & 3 {
-        case 1: return Cell(x: -c.z, y: c.y, z: c.x)
-        case 2: return Cell(x: -c.x, y: c.y, z: -c.z)
-        case 3: return Cell(x: c.z, y: c.y, z: -c.x)
-        default: return c
-        }
-    }
-
-    // MARK: dirty tracking
+    func clearDirty() { dirtyRects.removeAll(keepingCapacity: true) }
 
     private func markDirty(_ r: DirtyRect) {
         let c = DirtyRect(x0: max(0, r.x0), y0: max(0, r.y0), x1: min(width, r.x1), y1: min(height, r.y1))
         guard !c.isEmpty else { return }
         dirtyRects.append(c)
-        if dirtyRects.count > 128 {   // too fragmented: collapse to one box
+        if dirtyRects.count > 128 {
             dirtyRects = [dirtyRects.dropFirst().reduce(dirtyRects[0]) { $0.union($1) }]
         }
     }
 
-    func clearDirty() { dirtyRects.removeAll(keepingCapacity: true) }
+    func setCamera(_ cam: Camera) {
+        camPos = (Float(cam.position.x), Float(cam.position.y), Float(cam.position.z))
+        camAx = (Float(cam.ax.x), Float(cam.ax.y), Float(cam.ax.z))
+        camAy = (Float(cam.ay.x), Float(cam.ay.y), Float(cam.ay.z))
+        camAz = (Float(cam.az.x), Float(cam.az.y), Float(cam.az.z))
+        let p = cam.projection
+        projSx = Float(p.sx); projSy = Float(p.sy); projC = Float(p.c); projD = Float(p.d)
+        near = Float(cam.near)
+        // DirectionalLight direction in view space: normalize(viewMatrix * (lightPos - target)).
+        let l = cam.toViewDir(Material.lightPosition).normalized
+        lightDirView = (Float(l.x), Float(l.y), Float(l.z))
+    }
 
-    // MARK: drawing
+    /// Fill an axis-aligned rectangle black (the dissolve wipe's canvas2d squares).
+    func fillBlack(x: Int, y: Int, w: Int, h: Int) {
+        let x0 = max(0, x), y0 = max(0, y), x1 = min(width, x + w), y1 = min(height, y + h)
+        guard x1 > x0, y1 > y0 else { return }
+        pixels.withUnsafeMutableBufferPointer { px in
+            for yy in y0..<y1 { for xx in x0..<x1 { px[yy * width + xx] = 0xFF000000 } }
+        }
+        markDirty(DirtyRect(x0: x0, y0: y0, x1: x1, y1: y1))
+    }
 
-    private func blit(_ sprite: Sprite, at cell: Cell, palette: [UInt32]) {
-        let w = rotated(cell)
-        let s = proj.screen(Float(w.x), Float(w.y), Float(w.z))
-        let ax = Int((originX + s.0).rounded()), ay = Int((originY + s.1).rounded())
-        let baseDepth = Projection.depth(Float(w.x), Float(w.y), Float(w.z))
-        let width = self.width, height = self.height
+    private struct SV {  // screen-space vertex
+        var x: Float, y: Float, z: Float, invW: Float
+        var nx: Float, ny: Float, nz: Float     // view normal / w
+        var px: Float, py: Float, pz: Float     // view position / w
+    }
+
+    /// Rasterise a mesh placed at `position` with `rotation` (three.js
+    /// Object3D matrix = compose(position, quaternion, scale 1)).
+    func draw(_ mesh: Mesh, position: V3, rotation: Quat, material: Material) {
+        let W = Float(width), H = Float(height)
+        var sv = [SV](); sv.reserveCapacity(mesh.positions.count)
+        var behind = [Bool](repeating: false, count: mesh.positions.count)
+        var bbox: DirtyRect? = nil
+        for i in 0..<mesh.positions.count {
+            let pw = rotation.rotate(mesh.positions[i]) + position
+            let nw = rotation.rotate(mesh.normals[i])
+            // view space (Float from here on, like the GPU)
+            let dx = Float(pw.x) - camPos.0, dy = Float(pw.y) - camPos.1, dz = Float(pw.z) - camPos.2
+            let vx = dx * camAx.0 + dy * camAx.1 + dz * camAx.2
+            let vy = dx * camAy.0 + dy * camAy.1 + dz * camAy.2
+            let vz = dx * camAz.0 + dy * camAz.1 + dz * camAz.2
+            let nX = Float(nw.x), nY = Float(nw.y), nZ = Float(nw.z)
+            var tnx = nX * camAx.0 + nY * camAx.1 + nZ * camAx.2
+            var tny = nX * camAy.0 + nY * camAy.1 + nZ * camAy.2
+            var tnz = nX * camAz.0 + nY * camAz.1 + nZ * camAz.2
+            let nl = (tnx * tnx + tny * tny + tnz * tnz).squareRoot()
+            if nl > 0 { tnx /= nl; tny /= nl; tnz /= nl }   // vNormal = normalize(normalMatrix * normal)
+            let wc = -vz
+            if wc < near { behind[i] = true; sv.append(SV(x: 0, y: 0, z: 0, invW: 0, nx: 0, ny: 0, nz: 0, px: 0, py: 0, pz: 0)); continue }
+            let invW = 1 / wc
+            let sx = (projSx * vx * invW + 1) * 0.5 * W
+            let syUp = (projSy * vy * invW + 1) * 0.5 * H
+            let z = (projC * vz + projD) * invW
+            sv.append(SV(x: sx, y: syUp, z: z, invW: invW,
+                         nx: tnx * invW, ny: tny * invW, nz: tnz * invW,
+                         px: vx * invW, py: vy * invW, pz: vz * invW))
+            let r = DirtyRect(x0: Int(sx.rounded(.down)) - 1, y0: Int((H - syUp).rounded(.down)) - 1,
+                              x1: Int(sx.rounded(.up)) + 1, y1: Int((H - syUp).rounded(.up)) + 1)
+            bbox = bbox.map { $0.union(r) } ?? r
+        }
+        let idx = mesh.indices
+        var t = 0
+        while t + 2 < idx.count {
+            let i0 = idx[t], i1 = idx[t + 1], i2 = idx[t + 2]
+            t += 3
+            if behind[i0] || behind[i1] || behind[i2] { continue }
+            rasterize(sv[i0], sv[i1], sv[i2], material)
+        }
+        if let b = bbox { markDirty(b) }
+    }
+
+    @inline(__always) private func edge(_ ax: Float, _ ay: Float, _ bx: Float, _ by: Float, _ px: Float, _ py: Float) -> Float {
+        (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+    }
+
+    private func rasterize(_ v0: SV, _ v1: SV, _ v2: SV, _ mat: Material) {
+        // Signed area in window coords (y up): CCW > 0 is front-facing in GL.
+        let area = edge(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y)
+        guard area > 0 else { return }   // back-face culled (FrontSide)
+        let invArea = 1 / area
+        let minX = max(0, Int(min(v0.x, v1.x, v2.x).rounded(.down)))
+        let maxX = min(width - 1, Int(max(v0.x, v1.x, v2.x).rounded(.up)))
+        let minY = max(0, Int(min(v0.y, v1.y, v2.y).rounded(.down)))
+        let maxY = min(height - 1, Int(max(v0.y, v1.y, v2.y).rounded(.up)))
+        guard minX <= maxX, minY <= maxY else { return }
+        let lx = lightDirView.0, ly = lightDirView.1, lz = lightDirView.2
         pixels.withUnsafeMutableBufferPointer { px in
             depth.withUnsafeMutableBufferPointer { dz in
-                for p in sprite.pixels {
-                    let x = ax + Int(p.dx), y = ay + Int(p.dy)
-                    guard x >= 0, y >= 0, x < width, y < height else { continue }
-                    let i = y * width + x
-                    let d = baseDepth + p.depth
-                    if d < dz[i] {
-                        dz[i] = d
-                        px[i] = palette[Int(p.band)]
+                for yUp in minY...maxY {
+                    let py = Float(yUp) + 0.5
+                    let row = (height - 1 - yUp) * width
+                    for x in minX...maxX {
+                        let pxc = Float(x) + 0.5
+                        let w0 = edge(v1.x, v1.y, v2.x, v2.y, pxc, py)
+                        let w1 = edge(v2.x, v2.y, v0.x, v0.y, pxc, py)
+                        let w2 = edge(v0.x, v0.y, v1.x, v1.y, pxc, py)
+                        if w0 < 0 || w1 < 0 || w2 < 0 { continue }
+                        let l0 = w0 * invArea, l1 = w1 * invArea, l2 = w2 * invArea
+                        let z = l0 * v0.z + l1 * v1.z + l2 * v2.z
+                        let i = row + x
+                        if z > dz[i] { continue }          // depthFunc LEQUAL
+                        dz[i] = z
+                        // perspective-correct attributes
+                        let invW = l0 * v0.invW + l1 * v1.invW + l2 * v2.invW
+                        let rw = 1 / invW
+                        var nx = (l0 * v0.nx + l1 * v1.nx + l2 * v2.nx) * rw
+                        var ny = (l0 * v0.ny + l1 * v1.ny + l2 * v2.ny) * rw
+                        var nz = (l0 * v0.nz + l1 * v1.nz + l2 * v2.nz) * rw
+                        let ppx = (l0 * v0.px + l1 * v1.px + l2 * v2.px) * rw
+                        let ppy = (l0 * v0.py + l1 * v1.py + l2 * v2.py) * rw
+                        let ppz = (l0 * v0.pz + l1 * v1.pz + l2 * v2.pz) * rw
+                        let nl = (nx * nx + ny * ny + nz * nz).squareRoot()
+                        nx /= nl; ny /= nl; nz /= nl
+                        // viewDir = normalize(vViewPosition) = normalize(-position)
+                        var vdx = -ppx, vdy = -ppy, vdz = -ppz
+                        let vl = (vdx * vdx + vdy * vdy + vdz * vdz).squareRoot()
+                        vdx /= vl; vdy /= vl; vdz /= vl
+                        // RE_Direct_BlinnPhong
+                        let dotNL = max(0, min(1, nx * lx + ny * ly + nz * lz))
+                        let irr = dotNL * Material.lightIntensity * Float.pi
+                        var hx = lx + vdx, hy = ly + vdy, hz = lz + vdz
+                        let hl = (hx * hx + hy * hy + hz * hz).squareRoot()
+                        hx /= hl; hy /= hl; hz /= hl
+                        let dotNH = max(0, min(1, nx * hx + ny * hy + nz * hz))
+                        let dotLH = max(0, min(1, lx * hx + ly * hy + lz * hz))
+                        let fresnel = exp2((-5.55473 * dotLH - 6.98316) * dotLH)
+                        let D = (1 / Float.pi) * (Material.shininess * 0.5 + 1) * powf(dotNH, Material.shininess)
+                        let specScale = irr * 0.25 * D
+                        let lambert = irr / Float.pi           // BRDF_Diffuse_Lambert = color / PI
+                        let amb = Material.ambient * Float.pi / Float.pi
+                        func channel(_ c: Float, _ e: Float, _ s: Float) -> UInt32 {
+                            let F = (1 - s) * fresnel + s
+                            let v = c * lambert + amb * c + specScale * F + e
+                            let q = (max(0, min(1, v)) * 255 + 0.5).rounded(.down)
+                            return UInt32(q)
+                        }
+                        let r = channel(mat.color.0, mat.emissive.0, Material.specular.0)
+                        let g = channel(mat.color.1, mat.emissive.1, Material.specular.1)
+                        let b = channel(mat.color.2, mat.emissive.2, Material.specular.2)
+                        px[i] = 0xFF000000 | (r << 16) | (g << 8) | b
                     }
                 }
             }
         }
-        markDirty(DirtyRect(x0: ax + Int(sprite.minX), y0: ay + Int(sprite.minY),
-                            x1: ax + Int(sprite.maxX) + 1, y1: ay + Int(sprite.maxY) + 1))
+    }
+}
+
+// MARK: - The pipes simulation (port of the page's screensaver script) -------
+
+struct Cell: Hashable { var x: Int, y: Int, z: Int }
+
+final class PipeState {
+    var current: Cell
+    var positions: [Cell]
+    let material: Material?         // nil = candy-cane texture run (see note in update)
+    init(start: Cell, material: Material?) { current = start; positions = [start]; self.material = material }
+}
+
+final class PipesWorld {
+    let fb: Framebuffer
+    var rng: Mulberry32
+    var camera: Camera
+    private var nodes = Set<Cell>()
+    private var pipes: [PipeState] = []
+    private var runTexturePath = false
+    private var runTeapotChance = Tuning.teapotChance
+    private let disableTeapots: Bool
+
+    // Meshes the page builds per segment; identical every time, so build once.
+    private let cylinderMesh: Mesh
+    private let ballMesh: Mesh
+    private let elbowMesh: Mesh
+    private let teapotMesh: Mesh
+    private let candyMaterial = Material(rgb: 0xffffff)
+
+    // Wipe state (the dissolve): wall-clock driven like the page.
+    private(set) var clearing = false
+    private var nextClearAt: TimeInterval
+    private var dissolveRects: [(x: Int, y: Int)] = []
+    private var dissolveIndex = -1
+    private var dissolveRectsPerRow = 0, dissolveRectsPerColumn = 0
+    private var dissolveStart: TimeInterval = 0
+    private let useWallClock: Bool
+    private var virtualNow: TimeInterval = 0
+
+    private(set) var updateRounds = 0
+    private(set) var segments = 0
+    private(set) var teapots = 0
+    private(set) var wipes = 0
+
+    init(seed: UInt32, width: Int, height: Int, disableTeapots: Bool = false, wallClock: Bool = true) {
+        fb = Framebuffer(width: width, height: height)
+        rng = Mulberry32(a: seed)
+        camera = Camera(aspect: Double(width) / Double(height))
+        self.disableTeapots = disableTeapots
+        useWallClock = wallClock
+        cylinderMesh = MeshFactory.cylinder(radiusTop: Tuning.pipeRadius, radiusBottom: Tuning.pipeRadius,
+                                            height: 1, radialSegments: 10, heightSegments: 4)
+        ballMesh = MeshFactory.sphere(radius: Tuning.ballJointRadius, widthSegments: 8, heightSegments: 8)
+        elbowMesh = MeshFactory.sphere(radius: Tuning.pipeRadius, widthSegments: 8, heightSegments: 8)
+        teapotMesh = Teapot.mesh(size: Tuning.teapotSize)
+        // Script order in the page: the wipe timer's delay is drawn first,
+        // then look() picks the camera; pipes are spawned by the first frame.
+        nextClearAt = 0
+        let firstClearMs = random(Tuning.runSeconds.lowerBound, Tuning.runSeconds.upperBound) * 1000
+        nextClearAt = now + firstClearMs / 1000
+        look()
     }
 
-    private func drawCylinder(from a: Cell, direction d: Cell, palette: [UInt32]) {
-        // Rotate the direction into world space, then normalise so the sprite
-        // runs along +axis from the lower cell.
-        let wd = rotated(d)
-        var start = a
-        let axis: Int
-        if wd.x != 0 { axis = 0; if wd.x < 0 { start = a + d } }
-        else if wd.y != 0 { axis = 1; if wd.y < 0 { start = a + d } }
-        else { axis = 2; if wd.z < 0 { start = a + d } }
-        blit(cylinders[axis], at: start, palette: palette)
-        segments += 1
+    // MARK: random helpers, same call pattern as the page
+
+    private func random(_ x1: Double, _ x2: Double) -> Double { rng.next() * (x2 - x1) + x1 }
+    private func randomInteger(_ x1: Double, _ x2: Double) -> Int { Int(jsRound(random(x1, x2))) }
+    private func chance(_ p: Double) -> Bool { rng.next() < p }
+    private func chooseIndex(_ count: Int) -> Int { Int((rng.next() * Double(count)).rounded(.down)) }
+
+    private var now: TimeInterval { useWallClock ? ProcessInfo.processInfo.systemUptime : virtualNow }
+
+    // MARK: camera
+
+    private func look() {
+        if chance(1.0 / 2.0) {
+            camera.position = V3(0, 0, 14)
+        } else {
+            let axis = V3(random(-1, 1), random(-1, 1), random(-1, 1))
+            camera.position = applyRotationAxisMatrix(V3(14, 0, 0), axis: axis, angle: Double.pi / 2)
+        }
+        camera.lookAt(V3(0, 0, 0))
+        camera.orbitControlsUpdate()
+        fb.setCamera(camera)
     }
 
     // MARK: pipes
 
-    private func spawnPipe() {
-        for _ in 0..<64 {
-            let c = Cell(x: Int.random(in: -Tuning.gridX...Tuning.gridX),
-                         y: Int.random(in: -Tuning.gridY...Tuning.gridY),
-                         z: Int.random(in: -Tuning.gridZ...Tuning.gridZ))
-            if occupied[index(c)] { continue }
-            occupied[index(c)] = true
-            let pipe = Pipe(start: c, palette: palettes.randomElement()!)
-            blit(ball, at: c, palette: pipe.palette)
+    private func spawnPipes() {
+        // pipeOptions for this run
+        runTexturePath = false
+        runTeapotChance = disableTeapots ? 0 : Tuning.teapotChance
+        if chance(Tuning.candyRunChance) {
+            runTeapotChance = disableTeapots ? 0 : Tuning.candyTeapotChance
+            runTexturePath = true
+        }
+        let pipeCount = randomInteger(Double(Tuning.pipeCountRange.lowerBound), Double(Tuning.pipeCountRange.upperBound))
+        for _ in 0..<pipeCount {
+            let g = Double(Tuning.gridHalf)
+            let start = Cell(x: randomInteger(-g, g), y: randomInteger(-g, g), z: randomInteger(-g, g))
+            let material: Material? = runTexturePath ? nil : Material(rgb: Tuning.colors[chooseIndex(Tuning.colors.count)])
+            let pipe = PipeState(start: start, material: material)
+            nodes.insert(start)     // the page does not check occupancy here either
+            drawSphere(ballMesh, at: start, material: material)
             pipes.append(pipe)
-            return
         }
     }
 
-    /// One move attempt -- a direct port of the original Pipe.update().
-    private func step(_ pipe: Pipe) {
-        let direction: Cell
-        if let last = pipe.lastDirection, Bool.random() {
-            direction = last
+    private func inBounds(_ c: Cell) -> Bool {
+        abs(c.x) <= Tuning.gridHalf && abs(c.y) <= Tuning.gridHalf && abs(c.z) <= Tuning.gridHalf
+    }
+
+    private func update(_ pipe: PipeState) {
+        var lastDirection: Cell? = nil
+        if pipe.positions.count > 1 {
+            let last = pipe.positions[pipe.positions.count - 2]
+            lastDirection = Cell(x: pipe.current.x - last.x, y: pipe.current.y - last.y, z: pipe.current.z - last.z)
+        }
+        var direction: Cell
+        if chance(1.0 / 2.0), let ld = lastDirection {
+            direction = ld
         } else {
-            direction = Cell.axes.randomElement()!
+            direction = Cell(x: 0, y: 0, z: 0)
+            let axis = chooseIndex(3)                       // chooseFrom("xyz")
+            let sign = chooseIndex(2) == 0 ? 1 : -1         // chooseFrom([+1, -1])
+            switch axis { case 0: direction.x += sign; case 1: direction.y += sign; default: direction.z += sign }
         }
-        let next = pipe.current + direction
-        guard inBounds(next), !occupied[index(next)] else { return }
-        occupied[index(next)] = true
+        let next = Cell(x: pipe.current.x + direction.x, y: pipe.current.y + direction.y, z: pipe.current.z + direction.z)
+        guard inBounds(next) else { return }
+        guard !nodes.contains(next) else { return }
+        nodes.insert(next)
 
-        if let last = pipe.lastDirection, last != direction {
-            if Double.random(in: 0..<1) < Tuning.teapotChance {
-                blit(teapot, at: pipe.current, palette: pipe.palette)
+        if let ld = lastDirection, ld != direction {
+            if chance(runTeapotChance) {
+                drawTeapot(at: pipe.current, material: pipe.material)
+            } else if chance(Tuning.ballJointChance) {
+                drawSphere(ballMesh, at: pipe.current, material: pipe.material)
             } else {
-                blit(elbow, at: pipe.current, palette: pipe.palette)
+                drawSphere(elbowMesh, at: pipe.current, material: pipe.material)
             }
         }
-        drawCylinder(from: pipe.current, direction: direction, palette: pipe.palette)
+        drawCylinder(from: pipe.current, to: next, material: pipe.material)
         pipe.current = next
-        pipe.lastDirection = direction
+        pipe.positions.append(next)
     }
 
-    // MARK: runs and wipes
+    // MARK: drawing (only while not clearing; the page skips render then)
 
-    private func startRun() {
-        pixels.withUnsafeMutableBufferPointer { $0.update(repeating: 0xFF000000) }
-        depth.withUnsafeMutableBufferPointer { $0.update(repeating: .greatestFiniteMagnitude) }
-        occupied.withUnsafeMutableBufferPointer { $0.update(repeating: false) }
-        pipes.removeAll()
-        rotation = Int.random(in: 0..<4)
-        for _ in 0..<Int.random(in: Tuning.pipeCountRange) { spawnPipe() }
-        runEndsAt = ProcessInfo.processInfo.systemUptime + Double.random(in: Tuning.runSeconds)
-        dirtyRects = [fullRect]
+    private func mat(_ m: Material?) -> Material { m ?? candyMaterial }
+
+    private func drawCylinder(from a: Cell, to b: Cell, material: Material?) {
+        segments += 1
+        guard !clearing else { return }
+        let from = V3(Double(a.x), Double(a.y), Double(a.z)), to = V3(Double(b.x), Double(b.y), Double(b.z))
+        let delta = to - from
+        let q = Quat.fromUnitVectors(V3(0, 1, 0), delta.normalized)
+        let position = from + delta * 0.5
+        fb.draw(cylinderMesh, position: position, rotation: q, material: mat(material))
     }
 
-    private func startWipe() {
-        let cols = (width + Tuning.wipeBlock - 1) / Tuning.wipeBlock
-        let rows = (height + Tuning.wipeBlock - 1) / Tuning.wipeBlock
-        wipeBlocks = Array(0..<(cols * rows)).shuffled()
-        wipeIndex = 0
-        wipeBlocksPerTick = max(1, Int((Double(wipeBlocks.count) / (Tuning.wipeSeconds * Tuning.tickHz)).rounded(.up)))
+    private func drawSphere(_ mesh: Mesh, at c: Cell, material: Material?) {
+        guard !clearing else { return }
+        fb.draw(mesh, position: V3(Double(c.x), Double(c.y), Double(c.z)), rotation: .identity, material: mat(material))
+    }
+
+    private func drawTeapot(at c: Cell, material: Material?) {
+        // The page: rotation.x/y/z = floor(random(0, 50)) * PI / 2 (three draws).
+        let rx = (random(0, 50)).rounded(.down) * Double.pi / 2
+        let ry = (random(0, 50)).rounded(.down) * Double.pi / 2
+        let rz = (random(0, 50)).rounded(.down) * Double.pi / 2
+        teapots += 1
+        guard !clearing else { return }
+        fb.draw(teapotMesh, position: V3(Double(c.x), Double(c.y), Double(c.z)),
+                rotation: Quat.fromEulerXYZ(rx, ry, rz), material: mat(material))
+    }
+
+    // MARK: wipe
+
+    private func startClear() {
+        nextClearAt = now + random(Tuning.runSeconds.lowerBound, Tuning.runSeconds.upperBound)
+        guard !clearing else { return }
+        clearing = true
         wipes += 1
+        dissolve(seconds: Tuning.wipeSeconds)
     }
 
-    private func wipeTick() {
-        let cols = (width + Tuning.wipeBlock - 1) / Tuning.wipeBlock
-        let end = min(wipeBlocks.count, wipeIndex + wipeBlocksPerTick)
-        let width = self.width, height = self.height
-        var box: DirtyRect? = nil
-        pixels.withUnsafeMutableBufferPointer { px in
-            for i in wipeIndex..<end {
-                let bx = (wipeBlocks[i] % cols) * Tuning.wipeBlock
-                let by = (wipeBlocks[i] / cols) * Tuning.wipeBlock
-                for y in by..<min(height, by + Tuning.wipeBlock) {
-                    for x in bx..<min(width, bx + Tuning.wipeBlock) {
-                        px[y * width + x] = 0xFF000000
-                    }
-                }
-                let r = DirtyRect(x0: bx, y0: by, x1: bx + Tuning.wipeBlock, y1: by + Tuning.wipeBlock)
-                box = box.map { $0.union(r) } ?? r
-            }
+    private func dissolve(seconds: Double) {
+        dissolveRectsPerRow = Int((Double(fb.width) / 20).rounded(.up))
+        dissolveRectsPerColumn = Int((Double(fb.height) / 20).rounded(.up))
+        var rects: [(x: Int, y: Int)] = []
+        for i in 0..<(dissolveRectsPerRow * dissolveRectsPerColumn) {
+            rects.append((i % dissolveRectsPerRow, i / dissolveRectsPerRow))
         }
-        wipeIndex = end
-        if let b = box { markDirty(b) }
-        if wipeIndex >= wipeBlocks.count {
-            wipeBlocks = []
-            startRun()
+        // shuffleArrayInPlace
+        var i = rects.count - 1
+        while i > 0 {
+            let j = Int((rng.next() * Double(i + 1)).rounded(.down))
+            rects.swapAt(i, j)
+            i -= 1
+        }
+        dissolveRects = rects
+        dissolveIndex = 0
+        dissolveStart = now
+    }
+
+    private func dissolveStep() {
+        let elapsed = (now - dissolveStart) * 1000
+        let target = min(dissolveRects.count,
+                         Int((Double(dissolveRects.count) * elapsed / (Tuning.wipeSeconds * 1000)).rounded(.down)))
+        let rectW = Double(fb.width) / Double(dissolveRectsPerRow)
+        let rectH = Double(fb.height) / Double(dissolveRectsPerColumn)
+        while dissolveIndex < target {
+            let r = dissolveRects[dissolveIndex]
+            fb.fillBlack(x: Int((Double(r.x) * rectW).rounded(.down)), y: Int((Double(r.y) * rectH).rounded(.down)),
+                         w: Int(rectW.rounded(.up)), h: Int(rectH.rounded(.up)))
+            dissolveIndex += 1
+        }
+        if dissolveIndex == dissolveRects.count {
+            dissolveRects = []
+            dissolveIndex = -1
+            reset()
         }
     }
 
-    /// Advance the scene by one tick (1 / Tuning.tickHz seconds).
+    private func reset() {
+        fb.clear()
+        pipes.removeAll()
+        nodes.removeAll()
+        look()
+        clearing = false
+    }
+
+    // MARK: one frame (animate)
+
     func tick() {
-        ticks += 1
-        if !wipeBlocks.isEmpty {
-            wipeTick()
-            return
-        }
-        if ProcessInfo.processInfo.systemUptime >= runEndsAt {
-            startWipe()
-            return
-        }
-        let perTick = Tuning.stepsPerSecondPerPipe / Tuning.tickHz
-        for pipe in pipes {
-            pipe.stepAccumulator += perTick
-            while pipe.stepAccumulator >= 1 {
-                pipe.stepAccumulator -= 1
-                step(pipe)
-            }
-        }
+        if !useWallClock { virtualNow += 1.0 / Tuning.tickHz }
+        camera.orbitControlsUpdate()
+        if useWallClock, now >= nextClearAt { startClear() }
+        if !pipes.isEmpty { updateRounds += 1 }
+        for pipe in pipes { update(pipe) }
+        if pipes.isEmpty { spawnPipes() }
+        if dissolveIndex > -1 { dissolveStep() }
     }
 
     var summary: String {
-        "fb=\(width)x\(height) u=\(Int(proj.u)) pipes=\(pipes.count) segments=\(segments) wipes=\(wipes) ticks=\(ticks)"
+        let p = camera.position
+        return String(format: "fb=%dx%d rounds=%d pipes=%d segments=%d teapots=%d wipes=%d clearing=%d cam=(%.4f, %.4f, %.4f)",
+                      fb.width, fb.height, updateRounds, pipes.count, segments, teapots, wipes, clearing ? 1 : 0, p.x, p.y, p.z)
     }
 }
 
@@ -547,16 +771,14 @@ final class PipesScene {
 final class PipesSaverView: ScreenSaverView {
 
     private let pixelLayer = CALayer()
-    private var scene: PipesScene?
+    private var world: PipesWorld?
     private var tickTimer: Timer?
     private var frames = 0
-    /// Two IOSurfaces the compositor samples directly; `pending[i]` is what
-    /// still has to be copied into surface i before it can be shown again.
     private var surfaces: [IOSurface] = []
     private var pending: [[DirtyRect]] = [[], []]
     private var back = 0
 
-    private var hostSaidStop = false        // com.apple.screensaver.willstop seen after last start
+    private var hostSaidStop = false
     private var reconcileTimer: Timer?
     private var pendingStart: DispatchWorkItem?
     private let instanceID = UInt32.random(in: 1000...9999)
@@ -603,7 +825,6 @@ final class PipesSaverView: ScreenSaverView {
         pixelLayer.actions = ["contents": NSNull(), "bounds": NSNull(), "position": NSNull()]
         layer?.addSublayer(pixelLayer)
 
-        // We drive our own clock; keep the host's animateOneFrame quiet.
         animationTimeInterval = 1.0
 
         let dnc = DistributedNotificationCenter.default()
@@ -614,7 +835,6 @@ final class PipesSaverView: ScreenSaverView {
         dnc.addObserver(self, selector: #selector(saverDidStart(_:)),
                         name: Notification.Name("com.apple.screensaver.didstart"), object: nil)
 
-        // Own reconciliation clock: notifications only fire on changes.
         let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             if self.isRendering != self.shouldRender { self.syncState(reason: "timer") }
@@ -634,9 +854,6 @@ final class PipesSaverView: ScreenSaverView {
         let want = shouldRender
         slog("[\(instanceID)] sync(\(reason)) animating=\(isAnimating ? 1 : 0) hostStop=\(hostSaidStop ? 1 : 0) -> render=\(want ? 1 : 0) (rendering=\(isRendering ? 1 : 0), #\(serial) of \(liveInstances.count), newest=\(isNewestInstance ? 1 : 0))")
         if want && !isRendering && pendingStart == nil {
-            // Deferred: the host re-starts every OLD instance before creating
-            // the new one it will show; half a second lets the newcomer
-            // supersede them before they do any work.
             let work = DispatchWorkItem { [weak self] in
                 guard let self = self else { return }
                 self.pendingStart = nil
@@ -657,8 +874,9 @@ final class PipesSaverView: ScreenSaverView {
     private func startRendering() {
         let scale = max(1, Int((bounds.width / Tuning.targetFramebufferWidth).rounded()))
         let w = max(16, Int(bounds.width) / scale), h = max(16, Int(bounds.height) / scale)
-        let s = PipesScene(width: w, height: h)
-        scene = s
+        let seed = UInt32.random(in: 1...UInt32.max)
+        let wld = PipesWorld(seed: seed, width: w, height: h)
+        world = wld
         frames = 0
         surfaces = (0..<2).compactMap { _ in
             IOSurface(properties: [.width: w, .height: h, .bytesPerElement: 4,
@@ -667,34 +885,36 @@ final class PipesSaverView: ScreenSaverView {
         if surfaces.count < 2 { surfaces = []; slog("[\(instanceID)] IOSurface unavailable, using CGImage path") }
         pending = [[], []]
         back = 0
+        wld.tick()
         pushFrame()
         let t = Timer(timeInterval: 1.0 / Tuning.tickHz, repeats: true) { [weak self] _ in self?.tick() }
         t.tolerance = 0.2 / Tuning.tickHz
         RunLoop.main.add(t, forMode: .common)
         tickTimer = t
-        slog("[\(instanceID)] rendering started scale=\(scale) \(s.summary)")
+        slog("[\(instanceID)] rendering started scale=\(scale) seed=\(seed) \(wld.summary)")
     }
 
     private func stopRendering() {
         tickTimer?.invalidate()
         tickTimer = nil
-        if let s = scene { slog("[\(instanceID)] rendering stopped after \(frames) frames; \(s.summary)") }
-        scene = nil
+        if let w = world { slog("[\(instanceID)] rendering stopped after \(frames) frames; \(w.summary)") }
+        world = nil
         pixelLayer.contents = nil
         surfaces = []
     }
 
     private func tick() {
-        guard let s = scene else { return }
-        s.tick()
-        if s.dirty { pushFrame() }
+        guard let w = world else { return }
+        w.tick()
+        if w.fb.dirty { pushFrame() }
     }
 
     private func pushFrame() {
-        guard let s = scene else { return }
+        guard let wld = world else { return }
+        let fb = wld.fb
         guard surfaces.count == 2 else { pushFrameCGImage(); return }
-        let rects = s.dirtyRects
-        s.clearDirty()
+        let rects = fb.dirtyRects
+        fb.clearDirty()
         for i in 0..<2 {
             pending[i].append(contentsOf: rects)
             if pending[i].count > 256 { pending[i] = [pending[i].dropFirst().reduce(pending[i][0]) { $0.union($1) }] }
@@ -703,8 +923,8 @@ final class PipesSaverView: ScreenSaverView {
         surface.lock(options: [], seed: nil)
         let stride = surface.bytesPerRow
         let dst = surface.baseAddress
-        let w = s.width
-        s.pixels.withUnsafeBufferPointer { src in
+        let w = fb.width
+        fb.pixels.withUnsafeBufferPointer { src in
             guard let srcBase = src.baseAddress else { return }
             for r in pending[back] {
                 let bytes = (r.x1 - r.x0) * 4
@@ -720,21 +940,27 @@ final class PipesSaverView: ScreenSaverView {
         frames += 1
     }
 
-    /// Fallback when IOSurface allocation fails: full-frame CGImage (costly).
     private func pushFrameCGImage() {
-        guard let s = scene else { return }
-        let w = s.width, h = s.height
-        let data = s.pixels.withUnsafeBufferPointer { Data(buffer: $0) }
-        guard let provider = CGDataProvider(data: data as CFData),
-              let image = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
-                                  bytesPerRow: w * 4, space: CGColorSpaceCreateDeviceRGB(),
-                                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue
-                                                           | CGBitmapInfo.byteOrder32Little.rawValue),
-                                  provider: provider, decode: nil, shouldInterpolate: false,
-                                  intent: .defaultIntent) else { return }
+        guard let wld = world, let image = PipesSaverView.cgImage(of: wld.fb) else { return }
         pixelLayer.contents = image
-        s.clearDirty()
+        wld.fb.clearDirty()
         frames += 1
+    }
+
+    private static func cgImage(of fb: Framebuffer) -> CGImage? {
+        let data = fb.pixels.withUnsafeBufferPointer { Data(buffer: $0) }
+        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
+        return CGImage(width: fb.width, height: fb.height, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: fb.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                                | CGBitmapInfo.byteOrder32Little.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
+
+    private static func writePNG(_ image: CGImage, to path: String) -> Bool {
+        guard let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, "public.png" as CFString, 1, nil) else { return false }
+        CGImageDestinationAddImage(dest, image, nil)
+        return CGImageDestinationFinalize(dest)
     }
 
     // MARK: ScreenSaverView
@@ -771,38 +997,51 @@ final class PipesSaverView: ScreenSaverView {
         syncState(reason: "didstart")
     }
 
-    /// For verify.sh (called through the ObjC runtime).
+    // MARK: debug hooks (verify.sh, compare/)
+
     @objc func debugStats() -> String {
-        "rendering=\(isRendering) frames=\(frames) \(scene?.summary ?? "no scene")"
+        "rendering=\(isRendering) frames=\(frames) \(world?.summary ?? "no world")"
     }
 
-    /// For verify.sh: write the current framebuffer (unscaled) as a PNG.
+    /// Save the currently displayed surface as a PNG.
     @objc func debugWritePNG(_ path: String) -> Bool {
-        guard let s = scene else { return false }
-        // Read back the surface the compositor was last given (not the master
-        // framebuffer) so the image proves the IOSurface path itself.
-        let data: Data
-        let bytesPerRow: Int
+        guard let wld = world else { return false }
+        var image: CGImage? = nil
         if surfaces.count == 2 {
             let shown = surfaces[1 - back]
             shown.lock(options: [.readOnly], seed: nil)
-            bytesPerRow = shown.bytesPerRow
-            data = Data(bytes: shown.baseAddress, count: bytesPerRow * s.height)
+            let data = Data(bytes: shown.baseAddress, count: shown.bytesPerRow * wld.fb.height)
             shown.unlock(options: [.readOnly], seed: nil)
+            if let provider = CGDataProvider(data: data as CFData) {
+                image = CGImage(width: wld.fb.width, height: wld.fb.height, bitsPerComponent: 8, bitsPerPixel: 32,
+                                bytesPerRow: shown.bytesPerRow, space: CGColorSpaceCreateDeviceRGB(),
+                                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                                         | CGBitmapInfo.byteOrder32Little.rawValue),
+                                provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+            }
         } else {
-            bytesPerRow = s.width * 4
-            data = s.pixels.withUnsafeBufferPointer { Data(buffer: $0) }
+            image = PipesSaverView.cgImage(of: wld.fb)
         }
-        guard let provider = CGDataProvider(data: data as CFData),
-              let image = CGImage(width: s.width, height: s.height, bitsPerComponent: 8, bitsPerPixel: 32,
-                                  bytesPerRow: bytesPerRow, space: CGColorSpaceCreateDeviceRGB(),
-                                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue
-                                                           | CGBitmapInfo.byteOrder32Little.rawValue),
-                                  provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent),
-              let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, "public.png" as CFString, 1, nil)
-        else { return false }
-        CGImageDestinationAddImage(dest, image, nil)
-        return CGImageDestinationFinalize(dest)
+        guard let img = image else { return false }
+        return PipesSaverView.writePNG(img, to: path)
+    }
+
+    /// Deterministic offline render for comparison against the web page.
+    /// spec: "seed=7;updates=240;w=1470;h=956;png=/path;noteapot=1"
+    @objc func debugRender(_ spec: String) -> String {
+        var kv: [String: String] = [:]
+        for part in spec.split(separator: ";") {
+            let p = part.split(separator: "=", maxSplits: 1).map(String.init)
+            if p.count == 2 { kv[p[0]] = p[1] }
+        }
+        guard let seed = UInt32(kv["seed"] ?? ""), let updates = Int(kv["updates"] ?? ""),
+              let w = Int(kv["w"] ?? ""), let h = Int(kv["h"] ?? ""), let png = kv["png"] else { return "bad spec" }
+        let wld = PipesWorld(seed: seed, width: w, height: h, disableTeapots: kv["noteapot"] == "1", wallClock: false)
+        let t0 = Date()
+        while wld.updateRounds < updates { wld.tick() }
+        let ms = Int(Date().timeIntervalSince(t0) * 1000)
+        guard let img = PipesSaverView.cgImage(of: wld.fb), PipesSaverView.writePNG(img, to: png) else { return "png failed" }
+        return "NATIVE: \(wld.summary) render=\(ms)ms"
     }
 
     override var hasConfigureSheet: Bool { false }

@@ -3,7 +3,7 @@
 #   ./build.sh            -- build into ./build
 #   ./build.sh --install  -- build, then install to ~/Library/Screen Savers
 #
-# Fully native: no web view, no resources. Everything is in PipesSaverView.swift.
+# Fully native: no web view, no resources. Sources: PipesSaverView.swift, Teapot.swift.
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -19,14 +19,14 @@ echo "==> compiling"
 # -parse-as-library is required: a single-file swiftc build otherwise treats
 # the file as a main file and never initialises globals when NSBundle loads
 # the bundle (crashes the host with signal 11).
-swiftc -O \
+swiftc -O -wmo \
     -parse-as-library \
     -target "$TARGET" \
     -sdk "$SDK" \
     -module-name PipesSaver \
     -emit-object \
     -o "$BUILD/PipesSaver.o" \
-    "$SRC_DIR/PipesSaverView.swift"
+    "$SRC_DIR/PipesSaverView.swift" "$SRC_DIR/Teapot.swift"
 
 echo "==> linking bundle"
 # Must be MH_BUNDLE (-bundle), not a dylib, for NSBundle principalClass loading.
